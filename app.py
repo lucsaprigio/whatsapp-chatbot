@@ -18,6 +18,11 @@ def webhook():
 
     chat_id = data['payload']['from'] # Recebendo as chaves do waha
     received_message = data['payload']['body'] # Corpo da mensagem que o usuário está enviando
+    is_group = '@g.us' in chat_id
+    is_status = 'status@broadcast' in chat_id
+
+    if is_group or is_status:
+        return jsonify({'status': 'success', 'message': 'Mensagem ignorada'})
 
     waha.start_typing(chat_id=chat_id)
 
