@@ -1,54 +1,14 @@
 from flask import Flask, request, jsonify
-import unicodedata
 
 from bot.ai_bot import AIBot
 from services.waha import Waha
+from database.sqlite_db import SQLiteService
+from utils.functions import gera_liberacao, normalize_text, get_client_data
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-dados = [
-    {
-        'cpf_cnpj':'123456789',
-        'nome':'Lucas Aprigio'
-    }
-]
-conversation_states = []
-
-def normalize_text(text):
-    """Remove acentos e caracteres especiais de uma string."""
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', text)
-        if unicodedata.category(c) != 'Mn'
-    ).lower()
-
-def gera_liberacao():
-    return '1.2.3.4.5.6.7.8.9.0'
-
-def get_boletos():
-    return 'Boletos'
-
-def get_client_data(cpf_cnpj):
-    for cliente in dados:
-        if cliente['cpf_cnpj'] == cpf_cnpj:
-            return cliente
-    return None
-
-def get_conversation_state(chat_id):
-    """Obtém o estado da conversa para um chat_id específico."""
-    for conversation in conversation_states:
-        if conversation['chat_id'] == chat_id:
-            return conversation['state']
-    return None
-
-def update_conversation_state(chat_id, state):
-    """Atualiza ou cria o estado da conversa para um chat_id específico."""
-    for conversation in conversation_states:
-        if conversation['chat_id'] == chat_id:
-            conversation['state'] = state
-            return
-    # Se não existir, cria uma nova entrada
-    conversation_states.append({'chat_id': chat_id, 'state': state})
-
+sqlite_service = SQLiteService(db_path='conversation_states.db')
 
 @app.route('/chatbot/webhook/', methods=['POST'])
 def webhook():
@@ -56,6 +16,16 @@ def webhook():
 
     waha = Waha()
     ai_bot = AIBot()
+
+    if data['payload']['timestamp']:
+        event_time = datetime.fromtimestamp(data['payload']['timestamp'])
+        current_time = datetime.now() # retorna um timestamp atual
+
+        time_diff = current_time - event_time
+        
+    if time_diff > timedelta(minutes=5):
+        print("Mensagem ignorada mais de 5 minutos")
+        return jsonify({'status': 'ignored'})
 
     chat_id = data['payload']['from'] # Recebendo as chaves do waha
     received_message = data['payload']['body'] # Corpo da mensagem que o usuário está enviando
@@ -67,33 +37,44 @@ def webhook():
     
     waha.start_typing(chat_id=chat_id)
 
-    current_state = get_conversation_state(chat_id=chat_id)
+    current_state = sqlite_service.consulta_conversa_cliente(chat_id=chat_id)
+    print(current_state)
 
     if current_state is None:
        response = ai_bot.invoke(
            question=received_message, 
-           contexto='Pode responder o usuário como se fosse a primeira vez que ele entrou no sistema, e peça para ele digitar o CNPJ abaixo para cadastrar') 
+           contexto='Pode responder o usuário como se fosse a primeira vez que ele entrou no sistema, e peça para ele digitar o CNPJ abaixo para consultar.') 
        waha.send_message(
            chat_id=chat_id,
            message=response
        )
-       update_conversation_state(chat_id=chat_id, state='aguardando_cnpj')
+
+       sqlite_service.atualizar_conversa_cliente(chat_id=chat_id, state='aguardando_cnpj', cgc_cliente='0', nome_cliente='Não identificado')
        return jsonify({'status':'success'})
     
-    if current_state == 'aguardando_cnpj':
+    if current_state['state'] == 'aguardando_cnpj':
         if len(received_message) >= 11 and received_message.isdigit():
             cliente = get_client_data(cpf_cnpj=received_message)
-
             if cliente:
+                sqlite_service.atualizar_conversa_cliente(
+                        chat_id=chat_id, 
+                        state='conversa_normal', 
+                        cgc_cliente=cliente['cpf_cnpj'],
+                        nome_cliente=cliente['nome']
+                    )
                 waha.send_message(
                     chat_id=chat_id,
                     message=f'Seja bem-vindo {cliente['nome']} em que posso lhe ajudar?'
             )
-                update_conversation_state(chat_id=chat_id, state='conversa_normal')
+                
+                sqlite_service.atualizar_conversa_cliente(
+                    chat_id=chat_id, 
+                    state='conversa_opcoes'
+                )
             else:
                 waha.send_message(
                     chat_id=chat_id,
-                    message='Desculpe, CNPJ não cadastrado na empresa.'
+                    message='Desculpe, CNPJ não cadastrado no sistema😕 \n *Tente novamente*.'
             )
         else:
             waha.send_message(
@@ -101,31 +82,36 @@ def webhook():
                 message='CNPJ Inválido.'
             )
 
-            
-    if current_state == 'conversa_normal':
+    if current_state['state']  == 'conversa_opcoes':
         # Manipular palavras-chave ou continuar a conversa
-        if 'boletos' in received_message.lower():
+        if '1' in received_message:
+            # Consultar duplicatas em aberto caso estiver
+
             waha.send_message(
                 chat_id=chat_id,
-                message='Parece que há parcelas atrasadas no seu CNPJ! Deseja fazer download da última duplicata?'
+                message=f'Parece que há duplicatas em aberto \n 123\n123\n123'
             )
-        elif 'codigo de liberaçao' in normalize_text(received_message):
+
+            waha.send_message(
+                chat_id=chat_id,
+                message=f'Mas posso gerar um código de liberação para você. Deseja gerar o código?\n *1 - Sim*\n *2 - Não*'
+            )
+
+            sqlite_service.atualizar_conversa_cliente(chat_id, state='conversa_pendencias')
+        elif '2' in received_message:
             liberacao = gera_liberacao()
 
             waha.send_message(
                 chat_id=chat_id,
-                message=f'Segue seu código de liberação\n\n{liberacao}'
+                message=f'Segue seu código de liberação 0️⃣0️ \n\n{liberacao} '
             )
 
-            response = ai_bot.invoke(
-                    question=received_message, 
-                    contexto='Só pergunte o em que pode ajudar mais.'
-            ) 
             waha.send_message(
                 chat_id=chat_id,
-                message=response
+                message='Há algo mais que eu posso lhe ajudar? ☺'
             )
-        elif 'suporte' in received_message.lower():
+            sqlite_service.atualizar_conversa_cliente(chat_id, state='conversa_normal')
+        elif '3' in received_message.lower():
             waha.send_message(
                 chat_id=chat_id,
                 message='Segue os contatos abaixo: \
@@ -135,13 +121,45 @@ def webhook():
         else:
             response = ai_bot.invoke(
                 question=received_message, 
-                contexto='Sempre responda o cliente para colocar as opções específicas para o cliente digitar: "Código de liberação", "Boletos" ou "Suporte"')
+                contexto='Sempre responda o cliente para colocar as opções específicas para o cliente digitar: "1 - Pendências", "2 - Código de Liberação" ou "3 - Contatos Suporte"')
             waha.send_message(
                 chat_id=chat_id,
                 message=response
             )
 
-    waha.stop_typing(chat_id=chat_id)
+    if current_state['state'] == 'conversa_pendencias':
+       if received_message == '1':
+           liberacao = gera_liberacao()
+
+           waha.send_message(
+                chat_id=chat_id,
+                message=f'Segue seu código de liberação 0️⃣0️ \n\n{liberacao} '
+            )
+
+           waha.send_message(
+                chat_id=chat_id,
+                message='Há algo mais que eu posso lhe ajudar? ☺'
+            )
+           sqlite_service.atualizar_conversa_cliente(chat_id, state='conversa_normal')
+
+       if received_message == '2':
+           waha.send_message(
+               chat_id=chat_id,
+               message='Tudo bem! Se precisar de algo mais só avisar!'
+           )
+           sqlite_service.atualizar_conversa_cliente(chat_id, state='conversa_normal')
+
+    if current_state['state'] == 'conversa_normal':
+        response = ai_bot.invoke(
+            question=received_message, 
+            contexto='Sempre responda o cliente para colocar as opções específicas para o cliente digitar: "1 - Pendências", "2 - Código de Liberação" ou "3 - Contatos Suporte"')
+        waha.send_message(
+            chat_id=chat_id,
+            message=response
+        ) 
+           
+
+    waha.stop_typing(chat_id=chat_id) 
 
     return jsonify({'status': 'success'}), 200
 
